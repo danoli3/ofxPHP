@@ -1,0 +1,12 @@
+# Local build output
+/build/
+/build-*/
+/cmake-build-*/
+CMakeUserPresets.json
+
+# macOS and editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
