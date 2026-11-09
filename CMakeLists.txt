@@ -1,4 +1,4 @@
-# ofxPHP - CMake target for the addon (macOS arm64 binaries are bundled).
+# ofxPHP - CMake target for the addon (macOS arm64 + x86_64 XCFrameworks are bundled).
 #
 #   add_subdirectory(path/to/ofxPHP)
 #   target_link_libraries(my_app PRIVATE ofxPHP)
@@ -18,24 +18,43 @@ add_library(ofxPHP STATIC ${OFXPHP_DIR}/src/ofxPHP.cpp)
 target_compile_features(ofxPHP PUBLIC cxx_std_17)
 target_include_directories(ofxPHP PUBLIC ${OFXPHP_DIR}/src)
 
-if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64" OR (APPLE AND CMAKE_OSX_ARCHITECTURES STREQUAL "arm64"))
+set(OFXPHP_MACOS_SUPPORTED OFF)
+if(APPLE AND CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+	set(OFXPHP_ARCHITECTURES ${CMAKE_OSX_ARCHITECTURES})
+	if(NOT OFXPHP_ARCHITECTURES)
+		set(OFXPHP_ARCHITECTURES ${CMAKE_SYSTEM_PROCESSOR})
+	endif()
+	set(OFXPHP_MACOS_SUPPORTED ON)
+	foreach(arch IN LISTS OFXPHP_ARCHITECTURES)
+		if(NOT arch MATCHES "^(arm64|aarch64|x86_64)$")
+			set(OFXPHP_MACOS_SUPPORTED OFF)
+		endif()
+	endforeach()
+endif()
+
+if(OFXPHP_MACOS_SUPPORTED)
+	set(OFXPHP_SLICE macos-arm64_x86_64)
+	set(OFXPHP_LIBDIR ${OFXPHP_PHP}/lib/macos)
+	set(OFXPHP_HEADERS ${OFXPHP_LIBDIR}/libofxphp.xcframework/${OFXPHP_SLICE}/Headers/php)
 	target_compile_definitions(ofxPHP PUBLIC OFX_PHP=1)
 	target_include_directories(ofxPHP SYSTEM PUBLIC
-		${OFXPHP_PHP}/include/php
-		${OFXPHP_PHP}/include/php/main
-		${OFXPHP_PHP}/include/php/Zend
-		${OFXPHP_PHP}/include/php/TSRM
-		${OFXPHP_PHP}/include/php/sapi/embed)
-	# libofxphp.a is libphp merged into one object; consumers link it whole through this target.
+		${OFXPHP_HEADERS}
+		${OFXPHP_HEADERS}/main
+		${OFXPHP_HEADERS}/Zend
+		${OFXPHP_HEADERS}/TSRM
+		${OFXPHP_HEADERS}/sapi/embed)
+	# Use the universal macOS slice directly, including on CMake versions before XCFramework support.
 	target_link_libraries(ofxPHP PUBLIC
-		${OFXPHP_PHP}/lib/macos/libofxphp.a
-		${OFXPHP_PHP}/lib/macos/libonig.a
-		${OFXPHP_PHP}/lib/macos/libxml2.a
-		${OFXPHP_PHP}/lib/macos/libsqlite3.a
+		${OFXPHP_LIBDIR}/libofxphp.xcframework/${OFXPHP_SLICE}/libofxphp.a
+		${OFXPHP_LIBDIR}/libonig.xcframework/${OFXPHP_SLICE}/libonig.a
+		${OFXPHP_LIBDIR}/libxml2.xcframework/${OFXPHP_SLICE}/libxml2.a
+		${OFXPHP_LIBDIR}/libsqlite3.xcframework/${OFXPHP_SLICE}/libsqlite3.a
 		resolv iconv z)
 	# OpenSSL: an app links its own. The standalone test has none, so it uses the copy PHP was built with.
 	if(OFXPHP_BUILD_TESTS)
-		set(OFXPHP_TEST_LIBS ${OFXPHP_PHP}/lib/standalone/libssl.a ${OFXPHP_PHP}/lib/standalone/libcrypto.a)
+		set(OFXPHP_TEST_LIBS
+			${OFXPHP_PHP}/lib/standalone/libssl.xcframework/${OFXPHP_SLICE}/libssl.a
+			${OFXPHP_PHP}/lib/standalone/libcrypto.xcframework/${OFXPHP_SLICE}/libcrypto.a)
 	endif()
 else()
 	message(STATUS "ofxPHP: no bundled PHP binaries for this platform; building stubs")

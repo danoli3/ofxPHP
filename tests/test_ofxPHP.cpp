@@ -1,4 +1,4 @@
-// Embedded PHP server tests. Build: tests/run_embedded_tests.sh
+// Embedded PHP server tests. Build: make test (or CMake with OFXPHP_BUILD_TESTS=ON).
 #include "../src/ofxPHP.h"
 #include <cstdio>
 #include <fstream>
@@ -15,6 +15,19 @@ int main() {
 	fs::remove_all(root);
 	write(root / "site/index.php", "<?php echo 'hello ' . PHP_VERSION;");
 	write(root / "site/post.php", "<?php header('X-Test: yes'); echo 'got:' . ($_POST['a'] ?? 'none') . ' q:' . ($_GET['q'] ?? '');");
+	write(root / "site/modules.php", R"PHP(<?php
+foreach (['openssl', 'sqlite3', 'pdo_sqlite', 'dom', 'SimpleXML', 'xml', 'mbstring',
+          'session', 'ctype', 'tokenizer', 'fileinfo', 'filter'] as $extension) {
+    if (!extension_loaded($extension)) { echo 'missing:' . $extension; return; }
+}
+$db = new SQLite3(':memory:');
+$pdo = new PDO('sqlite::memory:');
+$xml = new DOMDocument();
+$xml->loadXML('<ok/>');
+echo openssl_digest('abc', 'sha256'), '|', $db->querySingle('SELECT 42'), '|',
+     $pdo->query('SELECT 43')->fetchColumn(), '|', $xml->documentElement->tagName, '|',
+     mb_strlen("h\xc3\xa9", 'UTF-8');
+)PHP");
 	write(root / "site/page.html", "<h1>static</h1>");
 	write(root / "secret.txt", "TOP SECRET");
 	CHECK(resolveInsideDocroot(root / "site", "/../secret.txt").empty());
@@ -32,6 +45,7 @@ int main() {
 	CHECK(sh(base + "-o /dev/null -w '%{http_code}'" + u + "/") == "200");
 	CHECK(sh(base + u + "/").find("hello 8.") == 0);
 	CHECK(sh(base + u + "/page.html") == "<h1>static</h1>");
+	CHECK(sh(base + u + "/modules.php") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad|42|43|ok|2");
 	CHECK(sh(base + "-d a=42 -D - '" + u.substr(1) + "/post.php?q=z'").find("got:42 q:z") != std::string::npos);
 	CHECK(sh(base + "-d a=42 -D - " + u + "/post.php").find("X-Test: yes") != std::string::npos);
 	CHECK(sh(base + "-o /dev/null -w '%{http_code}' --path-as-is" + u + "/../secret.txt") == "403");

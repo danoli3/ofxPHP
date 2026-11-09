@@ -10,3 +10,5 @@ CMakeUserPresets.json
 .vscode/
 *.swp
 *.swo
+__pycache__/
+*.pyc

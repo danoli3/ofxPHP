@@ -5,7 +5,7 @@ runs PHP through libphp's **Embed SAPI**. No child process, so it works under th
 `php -S` cannot be spawned.
 
 - PHP 8.5.1, **NTS** (not thread-safe): PHP requests run one at a time behind one mutex.
-- **macOS arm64** binaries are bundled. On any other platform the addon compiles as stubs
+- **macOS 12+, arm64 and x86_64** static XCFrameworks are bundled. On other platforms the addon compiles as stubs
   (`ofxphp::available()` is false, nothing runs), so a cross-platform project still builds.
 - Extracted from SuperServerMegaManager.
 
@@ -45,35 +45,62 @@ Requests that resolve outside the docroot (`..`, `%2e%2e`, symlinks out) get 403
 |---|---|
 | `src/ofxPHP.{h,cpp}` | the server and the PHP glue |
 | `libs/phpembed/include/php/` | PHP headers (`main`, `Zend`, `TSRM`, `sapi/embed`, ...) |
-| `libs/phpembed/lib/macos/` | auto-linked: `libofxphp.a` (libphp merged into one object), `libonig.a`, `libxml2.a`, `libsqlite3.a` |
-| `libs/phpembed/lib/standalone/` | `libssl.a`, `libcrypto.a`: **only** for this addon's own test build, never auto-linked |
+| `libs/phpembed/lib/macos/` | auto-linked: `libofxphp.xcframework` (libphp merged into one object), `libonig.xcframework`, `libxml2.xcframework`, `libsqlite3.xcframework` |
+| `libs/phpembed/lib/standalone/` | `libssl.xcframework`, `libcrypto.xcframework`: **only** for this addon's own test build, never auto-linked |
+| `libs/phpembed/build-info.json` | source versions, checksums, architectures and deployment target |
+| `scripts/build_macos_xcframeworks.py` | build both architectures and package all six XCFrameworks |
+| `scripts/macos-sources.json` | pinned source URLs and SHA-256 checksums |
 | `scripts/build_embed_lib.sh` | rebuild `libofxphp.a` from a `libphp.a` |
-| `tests/test_ofxPHP.cpp` | HTTP 200, POST + query, response headers, traversal blocked, 404 |
+| `tests/test_ofxPHP.cpp` | HTTP, POST + query, response headers, traversal blocked, 404, OpenSSL, SQLite/PDO, XML and mbstring |
 | `Makefile`, `CMakeLists.txt` | standalone build + test, and a CMake target for CMake users |
 
 ## Build and test the addon on its own
 
 ```sh
 make test                                                   # Makefile
+make test ARCHS=x86_64                                       # Intel; runs under Rosetta on Apple silicon
+make test ARCHS="arm64 x86_64"                                # Universal executable
 cmake -S . -B build -DOFXPHP_BUILD_TESTS=ON && cmake --build build && ctest --test-dir build   # CMake
 ```
 
 In a CMake project: `add_subdirectory(addons/ofxPHP)` then `target_link_libraries(app PRIVATE ofxPHP)`. Link
 your own OpenSSL (see below).
 
+For an Intel or universal CMake build, set `-DCMAKE_OSX_ARCHITECTURES=x86_64` or
+`'-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64'`. Set `-DCMAKE_OSX_DEPLOYMENT_TARGET=12.0` when configuring.
+
+## Rebuild the XCFrameworks
+
+With Xcode, Python 3, CMake and pkg-config installed:
+
+```sh
+make xcframeworks
+# or
+python3 scripts/build_macos_xcframeworks.py --jobs 8 --min-macos 12.0
+```
+
+The script verifies source checksums, builds PHP 8.5.1, oniguruma 6.9.10, libxml2 2.15.4,
+SQLite 3.54.1 and standalone OpenSSL 3.5.9 from source for each architecture, then combines each
+library into one universal `macos-arm64_x86_64` XCFramework slice. Both architectures use the same
+features and deployment target; no Homebrew libraries are linked. Generated PHP and OpenSSL
+headers select the correct architecture at compile time.
+
+Downloads, intermediate builds and logs stay in `build/macos/`. Completed dependency builds are
+reused. Use `--arch x86_64 --no-package` to build just Intel, or `--package-only` to repackage
+completed builds. Building and running Intel configure checks on Apple silicon requires Rosetta.
+The script also creates `build/ofxPHP-macos-xcframeworks.zip` with all six bundles, source metadata
+and license notices. The bundles contain macOS slices; iOS is not included.
+
 ## Things to know
 
-- **OpenSSL is not bundled where oF would pick it up.** PHP's openssl/curl code uses the OpenSSL your app
+- **OpenSSL is not bundled where oF would pick it up.** PHP's openssl extension uses the OpenSSL your app
   already links (openFrameworks provides one). Bundling a second copy in `lib/macos` would put two
-  OpenSSLs in one process. If your app has no OpenSSL, add `libs/phpembed/lib/standalone/*.a` to its link line.
+  OpenSSLs in one process. If your app has no OpenSSL, link both XCFrameworks in `libs/phpembed/lib/standalone/`.
 - **libsqlite3 and libxml2 are bundled** because Apple's system SQLite lacks `sqlite3_load_extension` and the
   system libxml2 lacks symbols PHP uses.
 - `libofxphp.a` hides only its bundled `_pcre2_*` symbols (so they cannot clash with an app's own pcre2).
   Hiding everything but the embed entry points breaks the link: the server calls the PHP API directly.
-- The bundled objects were built for macOS 14, the addon targets 12+, so the linker prints
-  "built for newer macOS" warnings. They are harmless here.
-- arm64 only. An x86_64 or iOS build needs its own `libphp.a`, merged with `scripts/build_embed_lib.sh`
-  (adapt `-arch` and `-platform_version`) into `lib/<platform>/`.
+- All bundled objects target macOS 12.0 on both arm64 and x86_64.
 
 ## Licences
 
