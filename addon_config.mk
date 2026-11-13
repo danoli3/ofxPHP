@@ -36,3 +36,8 @@ macos:
 	ADDON_INCLUDES += libs/phpembed/include/php/sapi/embed
 	ADDON_CFLAGS = -DOFX_PHP=1
 	ADDON_LDFLAGS = -lresolv -liconv -lz
+
+msys2:
+	# The HTTP server (static files, ranges, mounts) builds on Windows with Winsock; PHP itself is macOS-only for now.
+	# Visual Studio needs nothing here: ofxPHP.cpp has #pragma comment(lib, "ws2_32.lib").
+	ADDON_LDFLAGS = -lws2_32

@@ -37,6 +37,25 @@ ofxphp::shutdownEmbeddedPhp();            // once, at app exit
 and extra `$_SERVER` entries. `upload_max_filesize` / `post_max_size` are PHP_INI_PERDIR and are **not** applied.
 `ofxphp::embeddedPhpVersion()` returns e.g. `PHP 8.5.1 (embed)`.
 
+## Hosting static sites (also on Windows)
+
+`EmbeddedConfig` can also serve plain static folders with no PHP at all, which is why the server part builds on
+macOS, Linux and Windows (Winsock; PHP stays macOS-only). `ofxphp::serverAvailable()` says whether it is built.
+
+| Option | What |
+|---|---|
+| `bindAddress` | `"127.0.0.1"` (default) or `"0.0.0.0"` to serve the local network (IPv4 literal) |
+| `mounts` | `{"/ref13", folder}` pairs: a URL prefix served from any folder, never runs PHP, same `..`/symlink rules as the docroot. `/ref13` redirects to `/ref13/` |
+| `extraHeaders` | added to every response (security headers, `Cache-Control`...) |
+| `readOnly` | only GET and HEAD, else 405 with `Allow` |
+| `denyDotFiles` | 403 for any path segment starting with `.` |
+| `onRequest` | called per finished request with remote address, method, path, status and body bytes (thread-safe callback) |
+
+Static files are served with byte ranges (`206`, `416`, `Accept-Ranges`), which Safari on iPad needs for audio.
+`stop()` closes the listening port, wakes open connections and waits for them (10 s at most); it is safe to call
+twice and from the destructor. A client that hangs up mid-transfer cannot raise SIGPIPE. On Windows paths containing
+`\` or `:` are refused (separators and NTFS streams) and the port is bound with exclusive use.
+
 Requests that resolve outside the docroot (`..`, `%2e%2e`, symlinks out) get 403.
 
 ## Layout

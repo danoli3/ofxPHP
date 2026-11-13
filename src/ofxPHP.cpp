@@ -7,10 +7,28 @@
 #include <mutex>
 #include <sstream>
 
+#include <chrono>
+#include <thread>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#ifdef _MSC_VER
+#pragma comment(lib, "ws2_32.lib")
+#endif
+#else
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#endif
 
 #ifdef OFX_PHP
 extern "C" {
@@ -43,12 +61,21 @@ std::string urlDecode(const std::string & s) {
 fs::path resolveInsideDocroot(const fs::path & docroot, const std::string & urlPath) {
 	std::string decoded = urlDecode(urlPath);
 	if (decoded.find('\0') != std::string::npos) return {};
+#ifdef _WIN32
+	// "\" is a path separator here and ":" opens NTFS alternate streams ("page.php::$DATA" would read PHP source)
+	if (decoded.find_first_of("\\:") != std::string::npos) return {};
+#endif
 	std::error_code ec;
 	fs::path base = fs::weakly_canonical(docroot, ec);
 	if (ec) return {};
 	std::string rel = decoded;
 	while (!rel.empty() && rel[0] == '/') rel.erase(0, 1);
-	fs::path full = fs::weakly_canonical(base / rel, ec); // resolves "..", "." and symlinks
+#ifdef _WIN32
+	fs::path relPath = fs::u8path(rel); // the URL is UTF-8; fs::path(std::string) would read it as the ANSI code page
+#else
+	fs::path relPath = rel;
+#endif
+	fs::path full = fs::weakly_canonical(base / relPath, ec); // resolves "..", "." and symlinks
 	if (ec) return {};
 	// full must be base itself or live under base/
 	auto b = base.begin(), f = full.begin();
@@ -70,6 +97,44 @@ std::string mimeType(const fs::path & file) {
 	std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return std::tolower(c); });
 	auto it = types.find(ext);
 	return it == types.end() ? "application/octet-stream" : it->second;
+}
+
+std::string statusText(int s) {
+	switch (s) {
+	case 200: return "OK";
+	case 206: return "Partial Content";
+	case 301: return "Moved Permanently";
+	case 304: return "Not Modified";
+	case 400: return "Bad Request";
+	case 403: return "Forbidden";
+	case 404: return "Not Found";
+	case 405: return "Method Not Allowed";
+	case 413: return "Payload Too Large";
+	case 416: return "Range Not Satisfiable";
+	case 500: return "Internal Server Error";
+	default: return s < 300 ? "OK" : s < 400 ? "Redirect" : "Error";
+	}
+}
+
+bool parseByteRange(const std::string & h, size_t size, size_t & first, size_t & last) {
+	if (h.compare(0, 6, "bytes=") != 0 || h.find(',') != std::string::npos || size == 0) return false;
+	std::string spec = h.substr(6);
+	size_t dash = spec.find('-');
+	if (dash == std::string::npos) return false;
+	std::string a = spec.substr(0, dash), b = spec.substr(dash + 1);
+	auto digits = [](const std::string & t) { return !t.empty() && t.size() < 19 && std::all_of(t.begin(), t.end(), [](unsigned char c) { return std::isdigit(c); }); };
+	if (a.empty()) { // suffix: the last n bytes
+		if (!digits(b)) return false;
+		size_t n = std::stoull(b);
+		if (n == 0) return false;
+		first = n >= size ? 0 : size - n;
+		last = size - 1;
+		return true;
+	}
+	if (!digits(a) || (!b.empty() && !digits(b))) return false;
+	first = std::stoull(a);
+	last = b.empty() ? size - 1 : std::min<size_t>(std::stoull(b), size - 1);
+	return first < size && first <= last;
 }
 
 bool parseHttpRequest(const std::string & raw, HttpRequest & out, size_t & headerEnd) {
@@ -293,9 +358,25 @@ static HttpResponse simple(int status, const std::string & text) {
 	return r;
 }
 
+static HttpResponse serveFile(const fs::path & file, const HttpRequest & req);
+static bool serveMount(const EmbeddedConfig & cfg, const HttpRequest & req, HttpResponse & res);
+
 HttpResponse EmbeddedServer::handle(const HttpRequest & req, const std::string & remoteAddr) const {
+	if (cfg.readOnly && req.method != "GET" && req.method != "HEAD") {
+		HttpResponse r = simple(405, "Method Not Allowed");
+		r.headers.emplace_back("Allow", "GET, HEAD");
+		return r;
+	}
+	if (cfg.denyDotFiles) {
+		std::string decoded = urlDecode(req.path);
+		if (decoded.find("/.") != std::string::npos) return simple(403, "Forbidden");
+	}
 	if (req.method != "GET" && req.method != "POST" && req.method != "HEAD" && req.method != "PUT" && req.method != "DELETE" && req.method != "OPTIONS")
 		return simple(405, "Method Not Allowed");
+	{
+		HttpResponse mounted;
+		if (serveMount(cfg, req, mounted)) return mounted;
+	}
 	fs::path file = resolveInsideDocroot(cfg.docroot, req.path);
 	if (file.empty()) return simple(403, "Forbidden");
 	std::error_code ec;
@@ -319,27 +400,124 @@ HttpResponse EmbeddedServer::handle(const HttpRequest & req, const std::string &
 		if (!runEmbeddedPhp(cfg, file, req, remoteAddr, res) && res.body.empty()) return simple(500, "PHP failed to start");
 		return res;
 	}
+	return serveFile(file, req);
+}
+
+// A static file, with byte ranges (Safari on iPad will not play audio without them).
+static HttpResponse serveFile(const fs::path & file, const HttpRequest & req) {
 	std::ifstream in(file, std::ios::binary);
 	HttpResponse res;
 	res.headers.emplace_back("Content-Type", mimeType(file));
-	res.body.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+	res.headers.emplace_back("Accept-Ranges", "bytes");
+	std::string all((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+	auto range = req.headers.find("range");
+	if (range != req.headers.end() && req.method != "HEAD") {
+		size_t first = 0, last = 0;
+		if (!parseByteRange(range->second, all.size(), first, last)) {
+			res.status = 416;
+			res.headers.emplace_back("Content-Range", "bytes */" + std::to_string(all.size()));
+			return res;
+		}
+		res.status = 206;
+		res.headers.emplace_back("Content-Range", "bytes " + std::to_string(first) + "-" + std::to_string(last) + "/" + std::to_string(all.size()));
+		res.body = all.substr(first, last - first + 1);
+		return res;
+	}
+	res.body = std::move(all);
 	return res;
 }
+
+// A mounted static folder: a response when the path belongs to a mount, otherwise false.
+static bool serveMount(const EmbeddedConfig & cfg, const HttpRequest & req, HttpResponse & res) {
+	std::string path = urlDecode(req.path);
+	for (auto & [prefix, folder] : cfg.mounts) {
+		if (path != prefix && path.compare(0, prefix.size() + 1, prefix + "/") != 0) continue;
+		if (path == prefix) { // "/ref13" -> "/ref13/" so relative links resolve
+			res = simple(301, "Moved Permanently");
+			res.headers.emplace_back("Location", prefix + "/" + (req.query.empty() ? "" : "?" + req.query));
+			return true;
+		}
+		fs::path file = resolveInsideDocroot(folder, path.substr(prefix.size()));
+		std::error_code ec;
+		if (file.empty()) { res = simple(403, "Forbidden"); return true; }
+		if (fs::is_directory(file, ec)) file /= "index.html";
+		if (file.extension() == ".php" || !fs::is_regular_file(file, ec)) { res = simple(404, "Not Found"); return true; }
+		res = serveFile(file, req);
+		return true;
+	}
+	return false;
+}
+
+// Sockets: one small layer so the server below reads the same on POSIX and Windows (Winsock).
+namespace sock {
+using Handle = SocketHandle;
+constexpr Handle invalid = -1;
+#ifdef _WIN32
+inline bool init() {
+	static const bool ok = [] { WSADATA d; return WSAStartup(MAKEWORD(2, 2), &d) == 0; }();
+	return ok;
+}
+inline Handle make() { SOCKET s = ::socket(AF_INET, SOCK_STREAM, 0); return s == INVALID_SOCKET ? invalid : static_cast<Handle>(s); }
+inline void closeIt(Handle h) { ::closesocket(static_cast<SOCKET>(h)); }
+inline void wake(Handle h) { ::shutdown(static_cast<SOCKET>(h), SD_BOTH); }
+inline bool readable(Handle h, int ms) { WSAPOLLFD p { static_cast<SOCKET>(h), POLLRDNORM, 0 }; return ::WSAPoll(&p, 1, ms) > 0; }
+inline long long recvSome(Handle h, char * b, size_t n) { return ::recv(static_cast<SOCKET>(h), b, static_cast<int>(n), 0); }
+inline long long sendSome(Handle h, const char * b, size_t n) { return ::send(static_cast<SOCKET>(h), b, static_cast<int>(n), 0); }
+inline void recvTimeout(Handle h, int seconds) { DWORD ms = static_cast<DWORD>(seconds) * 1000; setsockopt(static_cast<SOCKET>(h), SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char *>(&ms), sizeof(ms)); }
+// SO_REUSEADDR on Windows lets another program take over a port that is in use; exclusive use is the safe equivalent
+inline void reuse(Handle h) { int on = 1; setsockopt(static_cast<SOCKET>(h), SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char *>(&on), sizeof(on)); }
+inline void noSigpipe(Handle) {}
+inline bool bindListen(Handle h, const sockaddr_in & a) { return ::bind(static_cast<SOCKET>(h), reinterpret_cast<const sockaddr *>(&a), sizeof(a)) == 0 && ::listen(static_cast<SOCKET>(h), 32) == 0; }
+inline Handle acceptOne(Handle h, sockaddr_in & peer) {
+	int len = sizeof(peer);
+	SOCKET s = ::accept(static_cast<SOCKET>(h), reinterpret_cast<sockaddr *>(&peer), &len);
+	return s == INVALID_SOCKET ? invalid : static_cast<Handle>(s);
+}
+#else
+inline bool init() { return true; }
+inline Handle make() { return ::socket(AF_INET, SOCK_STREAM, 0); }
+inline void closeIt(Handle h) { ::close(static_cast<int>(h)); }
+inline void wake(Handle h) { ::shutdown(static_cast<int>(h), SHUT_RDWR); }
+inline bool readable(Handle h, int ms) { pollfd p { static_cast<int>(h), POLLIN, 0 }; return ::poll(&p, 1, ms) > 0; }
+inline long long recvSome(Handle h, char * b, size_t n) { return ::recv(static_cast<int>(h), b, n, 0); }
+inline long long sendSome(Handle h, const char * b, size_t n) {
+#ifdef MSG_NOSIGNAL
+	return ::send(static_cast<int>(h), b, n, MSG_NOSIGNAL);   // a client that went away must not raise SIGPIPE
+#else
+	return ::send(static_cast<int>(h), b, n, 0);              // SO_NOSIGPIPE is set on the socket instead
+#endif
+}
+inline void recvTimeout(Handle h, int seconds) { timeval tv { seconds, 0 }; setsockopt(static_cast<int>(h), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)); }
+inline void reuse(Handle h) { int on = 1; setsockopt(static_cast<int>(h), SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)); }
+inline void noSigpipe(Handle h) {
+#ifdef SO_NOSIGPIPE
+	int on = 1;
+	setsockopt(static_cast<int>(h), SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
+#else
+	(void)h;
+#endif
+}
+inline bool bindListen(Handle h, const sockaddr_in & a) { return ::bind(static_cast<int>(h), reinterpret_cast<const sockaddr *>(&a), sizeof(a)) == 0 && ::listen(static_cast<int>(h), 32) == 0; }
+inline Handle acceptOne(Handle h, sockaddr_in & peer) {
+	socklen_t len = sizeof(peer);
+	return ::accept(static_cast<int>(h), reinterpret_cast<sockaddr *>(&peer), &len);
+}
+#endif
+} // namespace sock
 
 bool EmbeddedServer::start(const EmbeddedConfig & c) {
 	stop();
 	cfg = c;
-	listenFd = ::socket(AF_INET, SOCK_STREAM, 0);
-	if (listenFd < 0) return false;
-	int one = 1;
-	setsockopt(listenFd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+	if (!sock::init()) return false;
+	listenFd = sock::make();
+	if (listenFd == sock::invalid) return false;
+	sock::reuse(listenFd);
 	sockaddr_in addr {};
 	addr.sin_family = AF_INET;
 	addr.sin_port = htons(static_cast<uint16_t>(cfg.port));
-	inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr); // loopback only
-	if (::bind(listenFd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0 || ::listen(listenFd, 32) != 0) {
-		::close(listenFd);
-		listenFd = -1;
+	if (inet_pton(AF_INET, cfg.bindAddress.c_str(), &addr.sin_addr) != 1 || !sock::bindListen(listenFd, addr)) { // IPv4 literal only
+		sock::closeIt(listenFd);
+		listenFd = sock::invalid;
 		return false;
 	}
 	running = true;
@@ -348,26 +526,60 @@ bool EmbeddedServer::start(const EmbeddedConfig & c) {
 }
 
 void EmbeddedServer::stop() {
+	std::lock_guard<std::mutex> once(stopMutex);
 	if (!running.exchange(false)) return;
-	if (listenFd >= 0) { ::shutdown(listenFd, SHUT_RDWR); ::close(listenFd); listenFd = -1; }
+	// the accept loop polls with a short timeout and sees running == false; shutdown() on a listening socket
+	// does not reliably wake accept() on every platform, so don't depend on it
 	if (acceptor.joinable()) acceptor.join();
-	for (int i = 0; i < 100 && active > 0; i++) usleep(50000); // let in-flight requests finish
+	if (listenFd != sock::invalid) { sock::closeIt(listenFd); listenFd = sock::invalid; } // the port is free from here on
+	{
+		// wake connections blocked in recv(); the socket is still open while it is in the set
+		std::lock_guard<std::mutex> lock(clientsMutex);
+		for (SocketHandle fd : clients) sock::wake(fd);
+	}
+	for (int i = 0; i < 500 && active > 0; i++) std::this_thread::sleep_for(std::chrono::milliseconds(20)); // in-flight requests finish (10 s at most)
 }
 
 void EmbeddedServer::acceptLoop() {
 	while (running) {
+		if (!sock::readable(listenFd, 100)) continue;
 		sockaddr_in peer {};
-		socklen_t len = sizeof(peer);
-		int fd = ::accept(listenFd, reinterpret_cast<sockaddr *>(&peer), &len);
-		if (fd < 0) { if (!running) break; continue; }
+		SocketHandle fd = sock::acceptOne(listenFd, peer);
+		if (fd == sock::invalid) continue;
+		if (!running) { sock::closeIt(fd); break; }
+		sock::noSigpipe(fd); // a browser that aborts a transfer must not kill the app
+		{
+			std::lock_guard<std::mutex> lock(clientsMutex);
+			clients.insert(fd);
+		}
 		active++;
-		std::thread([this, fd] { serveClient(fd); active--; }).detach();
+		char ip[INET_ADDRSTRLEN] = "?";
+		inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof(ip));
+		std::string remote = ip;
+		std::thread([this, fd, remote] {
+			serveClient(fd, remote);
+			{
+				std::lock_guard<std::mutex> lock(clientsMutex);
+				clients.erase(fd);
+			}
+			sock::closeIt(fd);
+			active--;
+		}).detach();
 	}
 }
 
-void EmbeddedServer::serveClient(int fd) {
-	timeval tv { 10, 0 };
-	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+// Writes everything, or stops at the first error (a client that went away).
+static void sendAll(SocketHandle fd, const std::string & data) {
+	size_t sent = 0;
+	while (sent < data.size()) {
+		long long n = sock::sendSome(fd, data.data() + sent, data.size() - sent);
+		if (n <= 0) break;
+		sent += static_cast<size_t>(n);
+	}
+}
+
+void EmbeddedServer::serveClient(SocketHandle fd, const std::string & remote) {
+	sock::recvTimeout(fd, 10);
 	std::string raw;
 	char buf[16384];
 	HttpRequest req;
@@ -375,8 +587,8 @@ void EmbeddedServer::serveClient(int fd) {
 	bool parsed = false;
 	const size_t maxBody = 256u * 1024 * 1024;
 	while (!parsed) {
-		ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
-		if (n <= 0 || raw.size() > 1 << 20) { ::close(fd); return; }
+		long long n = sock::recvSome(fd, buf, sizeof(buf));
+		if (n <= 0 || raw.size() > 1 << 20) return;
 		raw.append(buf, static_cast<size_t>(n));
 		parsed = parseHttpRequest(raw, req, headerEnd);
 	}
@@ -386,21 +598,20 @@ void EmbeddedServer::serveClient(int fd) {
 	if (want > maxBody) {
 		HttpResponse r = simple(413, "Payload Too Large");
 		std::string out = "HTTP/1.1 413 Payload Too Large\r\nContent-Length: " + std::to_string(r.body.size()) + "\r\nConnection: close\r\n\r\n" + r.body;
-		::send(fd, out.data(), out.size(), 0);
-		::close(fd);
+		sendAll(fd, out);
 		return;
 	}
 	req.body = raw.substr(headerEnd);
 	while (req.body.size() < want) {
-		ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+		long long n = sock::recvSome(fd, buf, sizeof(buf));
 		if (n <= 0) break;
 		req.body.append(buf, static_cast<size_t>(n));
 	}
 	if (req.body.size() > want) req.body.resize(want);
 
-	HttpResponse res = handle(req, "127.0.0.1");
+	HttpResponse res = handle(req, remote);
 	bool hasLen = false;
-	std::string out = "HTTP/1.1 " + std::to_string(res.status) + " " + (res.status == 200 ? "OK" : res.status == 404 ? "Not Found" : "Status") + "\r\n";
+	std::string out = "HTTP/1.1 " + std::to_string(res.status) + " " + statusText(res.status) + "\r\n";
 	for (auto & [k, v] : res.headers) {
 		std::string lk = k;
 		std::transform(lk.begin(), lk.end(), lk.begin(), [](unsigned char c) { return std::tolower(c); });
@@ -408,15 +619,11 @@ void EmbeddedServer::serveClient(int fd) {
 		out += k + ": " + v + "\r\n";
 	}
 	(void)hasLen;
+	for (auto & [k, v] : cfg.extraHeaders) out += k + ": " + v + "\r\n";
 	out += "Content-Length: " + std::to_string(req.method == "HEAD" ? res.body.size() : res.body.size()) + "\r\nConnection: close\r\n\r\n";
 	if (req.method != "HEAD") out += res.body;
-	size_t sent = 0;
-	while (sent < out.size()) {
-		ssize_t n = ::send(fd, out.data() + sent, out.size() - sent, 0);
-		if (n <= 0) break;
-		sent += static_cast<size_t>(n);
-	}
-	::close(fd);
+	sendAll(fd, out);
+	if (cfg.onRequest) cfg.onRequest({ remote, req.method, req.path, res.status, req.method == "HEAD" ? 0 : res.body.size() });
 	if (log) log(req.method + " " + req.target + " -> " + std::to_string(res.status));
 }
 
